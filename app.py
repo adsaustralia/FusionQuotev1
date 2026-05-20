@@ -2,351 +2,410 @@ import io
 import json
 import re
 import traceback
-import zipfile
-import xml.etree.ElementTree as ET
+from copy import copy
+from typing import Dict, List, Tuple, Optional
 
 import streamlit as st
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill, Font, Alignment
+from openpyxl.utils import get_column_letter, column_index_from_string
 
-APP_VERSION = "V2.3 Minimal Stable"
+st.set_page_config(page_title="Excel Formula Fusion", layout="wide")
 
+st.markdown("""
+<style>
+html, body, [class*="css"] { color: #111111 !important; }
+.stApp { background: #f7f7f7; }
+section[data-testid="stSidebar"] { background: #ffffff !important; }
+input, textarea, select { color: #111111 !important; background-color: #ffffff !important; }
+div[data-baseweb="select"] * { color: #111111 !important; }
+div[data-baseweb="input"] * { color: #111111 !important; }
+button, .stDownloadButton button { color: #111111 !important; background-color: #ffffff !important; border: 1px solid #999 !important; }
+.primary-box { background: #ffffff; padding: 1rem; border-radius: 0.7rem; border: 1px solid #ddd; }
+.warn-box { background: #fff3cd; padding: 0.8rem; border-radius: 0.5rem; border: 1px solid #ffda6a; }
+.good-box { background: #d1e7dd; padding: 0.8rem; border-radius: 0.5rem; border: 1px solid #badbcc; }
+</style>
+""", unsafe_allow_html=True)
 
-def norm(v):
-    return "" if v is None else str(v).strip()
-
-
-def safe_col(v, default):
-    v = (v or "").strip().upper()
-    return v if re.fullmatch(r"[A-Z]{1,3}", v) else default
-
-
-def quote_sheet(name):
-    return str(name).replace("'", "''")
-
-
-def get_sheet_names_fast(xlsx_bytes):
-    ns = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
-    with zipfile.ZipFile(io.BytesIO(xlsx_bytes)) as z:
-        root = ET.fromstring(z.read("xl/workbook.xml"))
-    return [el.attrib.get("name", "") for el in root.findall("main:sheets/main:sheet", ns) if el.attrib.get("name")]
-
-
-def default_sheet(sheets, wanted, fallback=0):
-    for s in sheets:
-        if s.lower().strip() == wanted.lower().strip():
-            return sheets.index(s)
-    return min(fallback, len(sheets) - 1) if sheets else 0
+RED_FILL = PatternFill("solid", fgColor="FFC7CE")
+ORANGE_FILL = PatternFill("solid", fgColor="FCE4D6")
+YELLOW_FILL = PatternFill("solid", fgColor="FFF2CC")
+GREEN_FILL = PatternFill("solid", fgColor="D9EAD3")
 
 
-def load_openpyxl_bits():
-    from openpyxl import load_workbook
-    from openpyxl.styles import Font, PatternFill
-    from openpyxl.utils import column_index_from_string, get_column_letter
-    return load_workbook, Font, PatternFill, column_index_from_string, get_column_letter
+def safe_text(v) -> str:
+    if v is None:
+        return ""
+    return str(v).strip()
 
 
-def detect_multiplier(text):
-    t = norm(text).upper()
-    m = re.search(r"\bSET\s*(?:OF)?\s*(\d{1,3})\b", t)
+def norm(s: str) -> str:
+    return re.sub(r"\s+", " ", safe_text(s)).strip().upper()
+
+
+def parse_col(value: str, default: str) -> str:
+    value = safe_text(value).upper()
+    if not value:
+        return default
+    value = re.sub(r"[^A-Z]", "", value)
+    return value or default
+
+
+def copy_cell_style(src, dst):
+    if src.has_style:
+        dst.font = copy(src.font)
+        dst.fill = copy(src.fill)
+        dst.border = copy(src.border)
+        dst.alignment = copy(src.alignment)
+        dst.number_format = src.number_format
+        dst.protection = copy(src.protection)
+
+
+def detect_multiplier(name: str) -> Tuple[int, str, str]:
+    """Return multiplier, status, reason. status: exact/doubt/none."""
+    txt = norm(name)
+    if not txt:
+        return 1, "none", ""
+    m = re.search(r"\bSET\s+OF\s+(\d+)\b", txt)
     if m:
-        n = int(m.group(1))
-        if 1 < n <= 500:
-            return n, "RED", f"set of {n}"
-    m = re.search(r"\b(?:1\s*)?PACK\s*=\s*(\d{1,5})\b", t)
+        return int(m.group(1)), "exact", f"set of {m.group(1)}"
+    m = re.search(r"\b1\s*PACK\s*=\s*(\d+)\b", txt)
     if m:
-        n = int(m.group(1))
-        if 1 < n <= 10000:
-            return n, "RED", f"pack = {n}"
-    m = re.search(r"\bPACK\s+OF\s+(\d{1,5})\b", t)
+        return int(m.group(1)), "exact", f"1 pack = {m.group(1)}"
+    m = re.search(r"\bPACK\s+OF\s+(\d+)\b", txt)
     if m:
-        n = int(m.group(1))
-        if 1 < n <= 10000:
-            return n, "RED", f"pack of {n}"
-    if "PACK" in t or "SET" in t:
-        return 1, "ORANGE", "unclear pack/set wording"
-    return 1, "", ""
+        return int(m.group(1)), "exact", f"pack of {m.group(1)}"
+    if "SET" in txt or "PACK" in txt:
+        return 1, "doubt", "contains set/pack but no safe multiplier"
+    return 1, "none", ""
 
 
-def size_to_sqm(size_text):
-    s = norm(size_text).lower().replace("×", "x").replace(",", "")
-    nums = re.findall(r"(\d+(?:\.\d+)?)", s)
-    if len(nums) >= 2:
-        w, h = float(nums[0]), float(nums[1])
-        if "cm" in s and "mm" not in s:
-            return (w / 100.0) * (h / 100.0)
-        if re.search(r"\bm\b", s) and "mm" not in s and "cm" not in s:
-            return w * h
-        return (w / 1000.0) * (h / 1000.0)
-    if len(nums) == 1 and ("dia" in s or "ø" in s or "round" in s):
-        d = float(nums[0])
-        if "cm" in s and "mm" not in s:
-            dm = d / 100.0
-        elif re.search(r"\bm\b", s) and "mm" not in s and "cm" not in s:
-            dm = d
-        else:
-            dm = d / 1000.0
-        return 3.141592653589793 * (dm / 2.0) ** 2
-    return 0.0
+def parse_size_to_sqm(size_text: str) -> Optional[float]:
+    txt = safe_text(size_text).lower().replace("×", "x")
+    nums = re.findall(r"(\d+(?:\.\d+)?)", txt)
+    if len(nums) < 2:
+        return None
+    w = float(nums[0])
+    h = float(nums[1])
+    # default mm; cm if explicitly contains cm and not mm
+    if "cm" in txt and "mm" not in txt:
+        return (w / 100) * (h / 100)
+    return (w / 1000) * (h / 1000)
 
 
-def ignored_array(ignore_list):
-    vals = [x.strip().upper().replace('"', '') for x in ignore_list if x.strip()]
-    if not vals:
-        vals = ["NZ"]
-    return "{" + ",".join('"' + x + '"' for x in vals) + "}"
+def get_sheet_names(file_bytes: bytes) -> List[str]:
+    wb = load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=False)
+    names = wb.sheetnames
+    wb.close()
+    return names
 
 
-def clean_qty_formula(col, total_row, scan_start, scan_end, country_col, ignored, multiplier):
-    arr = ignored_array(ignored)
-    base = f"({col}${total_row}-SUMPRODUCT(({col}${scan_start}:{col}${scan_end})*(--ISNUMBER(MATCH(UPPER(${country_col}${scan_start}:${country_col}${scan_end}),{arr},0)))))"
-    return f"={base}*{multiplier}" if multiplier != 1 else f"={base}"
+def get_values_for_stock_options(file_bytes: bytes, sheet_name: str, stock_row: int, start_col: str, end_col: str) -> List[str]:
+    wb = load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
+    ws = wb[sheet_name]
+    sc = column_index_from_string(start_col)
+    ec = column_index_from_string(end_col)
+    stocks = []
+    for c in range(sc, ec + 1):
+        val = safe_text(ws.cell(stock_row, c).value)
+        if val and val not in stocks:
+            stocks.append(val)
+    wb.close()
+    return stocks
 
 
-def ds_lookup_formula(col, cfg):
-    rs = quote_sheet(cfg["reference_sheet"])
-    return (
-        f"=IFERROR(INDEX('{rs}'!${cfg['ref_ds_col']}${cfg['ref_start_row']}:${cfg['ref_ds_col']}${cfg['ref_end_row']},"
-        f"MATCH(1,INDEX(('{rs}'!${cfg['ref_name_col']}${cfg['ref_start_row']}:${cfg['ref_name_col']}${cfg['ref_end_row']}={col}${cfg['name_row']})*"
-        f"('{rs}'!${cfg['ref_size_col']}${cfg['ref_start_row']}:${cfg['ref_size_col']}${cfg['ref_end_row']}={col}${cfg['size_row']}),0),0)),\"\")"
-    )
+def build_workbook(
+    file_bytes: bytes,
+    working_sheet: str,
+    reference_sheet: str,
+    name_row: int,
+    size_row: int,
+    stock_row: int,
+    total_qty_row: int,
+    country_col: str,
+    start_col: str,
+    end_col: str,
+    ignore_countries: List[str],
+    ds_output_row: int,
+    clean_qty_output_row: int,
+    sqm_output_row: int,
+    price_output_row: int,
+    ref_name_col: str,
+    ref_size_col: str,
+    ref_ds_col: str,
+    ref_stock_col: str,
+    ref_start_row: int,
+    ref_end_row: int,
+    selected_stocks: List[str],
+    stock_rates: Dict[str, float],
+    ds_loading_pct: float,
+) -> bytes:
+    # formula preserving workbook
+    wb = load_workbook(io.BytesIO(file_bytes), data_only=False)
+    # value-only workbook for stock/material values
+    wb_values = load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=True)
+    ws = wb[working_sheet]
+    ws_values = wb_values[working_sheet]
 
+    sc = column_index_from_string(start_col)
+    ec = column_index_from_string(end_col)
+    country_col = parse_col(country_col, "I")
+    ignored = [c.strip().upper() for c in ignore_countries if c.strip()]
 
-def get_stock_options(xlsx_bytes, cfg):
-    load_workbook, _, _, col_index, _ = load_openpyxl_bits()
-    wb = load_workbook(io.BytesIO(xlsx_bytes), read_only=True, data_only=True)
-    try:
-        ws = wb[cfg["working_sheet"]]
-        start_i = col_index(cfg["item_start_col"])
-        end_i = col_index(cfg["item_end_col"])
-        result, seen = [], set()
-        for c in range(start_i, end_i + 1):
-            v = norm(ws.cell(cfg["stock_row"], c).value)
-            key = v.upper()
-            if v and key not in seen:
-                seen.add(key)
-                result.append(v)
-        return result
-    finally:
-        wb.close()
+    # Output row labels
+    ws.cell(ds_output_row, max(1, sc - 1)).value = "DS/SS Lookup"
+    ws.cell(clean_qty_output_row, max(1, sc - 1)).value = "Clean Qty"
+    ws.cell(sqm_output_row, max(1, sc - 1)).value = "SQM"
+    ws.cell(price_output_row, max(1, sc - 1)).value = "Price"
 
+    # crude but safe ignored qty formula: total row minus sum of ignored country rows.
+    # Since workbook row layout varies, we look from row 8 to one row above total output labels by default.
+    # Blank country rows are excluded because only matched ignored countries are summed.
+    scan_start_row = total_qty_row + 1
+    scan_end_row = min(ws.max_row, ds_output_row - 1) if ds_output_row > scan_start_row else ws.max_row
 
-def detect_country_scan_end(xlsx_bytes, cfg):
-    load_workbook, _, _, col_index, _ = load_openpyxl_bits()
-    wb = load_workbook(io.BytesIO(xlsx_bytes), read_only=True, data_only=True)
-    try:
-        ws = wb[cfg["working_sheet"]]
-        c = col_index(cfg["country_col"])
-        start = cfg["total_qty_row"] + 1
-        last = start
-        tokens = {"NZ", "AUS", "AU", "AUSTRALIA", "NEW ZEALAND", "FIJI", "SG", "SINGAPORE"}
-        for r in range(start, min(ws.max_row, 500) + 1):
-            if norm(ws.cell(r, c).value).upper() in tokens:
-                last = r
-        return max(last, start)
-    finally:
-        wb.close()
+    # Add / replace audit sheets
+    for s in ["Stock SQM Summary", "Qty Multiplier Audit"]:
+        if s in wb.sheetnames:
+            del wb[s]
+    sum_ws = wb.create_sheet("Stock SQM Summary")
+    audit_ws = wb.create_sheet("Qty Multiplier Audit")
 
+    sum_ws.append(["Stock/Material", "Rate", "Total SQM", "DS Loading %", "Estimated Value"])
+    audit_ws.append(["Column", "Name", "Detected Multiplier", "Status", "Reason"])
 
-def build_workbook(xlsx_bytes, cfg, rates):
-    load_workbook, Font, PatternFill, col_index, get_col = load_openpyxl_bits()
-    wb = load_workbook(io.BytesIO(xlsx_bytes))
-    wbv = load_workbook(io.BytesIO(xlsx_bytes), data_only=True, read_only=True)
-    try:
-        ws = wb[cfg["working_sheet"]]
-        wsv = wbv[cfg["working_sheet"]]
-        start_i, end_i = col_index(cfg["item_start_col"]), col_index(cfg["item_end_col"])
-        selected = set(cfg.get("selected_stocks", []))
-        ds_factor = 1 + float(cfg.get("ds_loading", 20.0)) / 100.0
-        red = PatternFill("solid", fgColor="FFC7CE")
-        orange = PatternFill("solid", fgColor="FCE4D6")
-        yellow = PatternFill("solid", fgColor="FFF2CC")
-        blue = PatternFill("solid", fgColor="1F4E78")
-        white = Font(color="FFFFFF", bold=True)
-        def head(cell):
-            cell.fill = blue
-            cell.font = white
-        for row, label in [(cfg["ds_row"], "DS/SS"), (cfg["clean_qty_row"], "Clean Qty"), (cfg["multiplier_row"], "Multiplier"), (cfg["sqm_row"], "SQM"), (cfg["price_row"], "Price")]:
-            ws.cell(row, 1).value = label
-            head(ws.cell(row, 1))
-        audit = []
-        for c in range(start_i, end_i + 1):
-            col = get_col(c)
-            name = norm(wsv.cell(cfg["name_row"], c).value or ws.cell(cfg["name_row"], c).value)
-            size = norm(wsv.cell(cfg["size_row"], c).value or ws.cell(cfg["size_row"], c).value)
-            stock = norm(wsv.cell(cfg["stock_row"], c).value or ws.cell(cfg["stock_row"], c).value)
-            multiplier, flag, reason = detect_multiplier(name)
-            ws.cell(cfg["ds_row"], c).value = ds_lookup_formula(col, cfg)
-            ws.cell(cfg["clean_qty_row"], c).value = clean_qty_formula(col, cfg["total_qty_row"], cfg["country_scan_start"], cfg["country_scan_end"], cfg["country_col"], cfg["ignored_countries"], multiplier)
-            ws.cell(cfg["multiplier_row"], c).value = multiplier
-            sqm_each = size_to_sqm(size)
-            ws.cell(cfg["sqm_row"], c).value = f"={col}${cfg['clean_qty_row']}*{sqm_each:.6f}" if sqm_each else ""
-            rate = float(rates.get(stock, 0) or 0)
-            if stock in selected and rate > 0:
-                ws.cell(cfg["price_row"], c).value = f'=IF(UPPER({col}${cfg["ds_row"]})="DS",{col}${cfg["sqm_row"]}*{rate}*{ds_factor},{col}${cfg["sqm_row"]}*{rate})'
-            if flag == "RED":
-                ws.cell(cfg["name_row"], c).fill = red
-                ws.cell(cfg["clean_qty_row"], c).fill = red
-                audit.append([col, name, size, stock, multiplier, flag, reason])
-            elif flag == "ORANGE":
-                ws.cell(cfg["name_row"], c).fill = orange
-                audit.append([col, name, size, stock, multiplier, flag, reason])
-            if stock in selected:
-                ws.cell(cfg["stock_row"], c).fill = yellow
-        for sheet_name in ["Qty Multiplier Audit", "Stock SQM Summary"]:
-            if sheet_name in wb.sheetnames:
-                del wb[sheet_name]
-        aud = wb.create_sheet("Qty Multiplier Audit")
-        aud.append(["Column", "Name", "Size", "Stock", "Multiplier", "Flag", "Reason"])
-        for cell in aud[1]:
-            head(cell)
-        for row in audit:
-            aud.append(row)
-        sm = wb.create_sheet("Stock SQM Summary")
-        sm.append(["Stock", "Rate / SQM", "Total SQM", "Estimated Price", "DS Loading %"])
-        for cell in sm[1]:
-            head(cell)
-        work = quote_sheet(cfg["working_sheet"])
-        for r, stock in enumerate(cfg.get("selected_stocks", []), start=2):
-            sm.cell(r, 1).value = stock
-            sm.cell(r, 2).value = float(rates.get(stock, 0) or 0)
-            sm.cell(r, 3).value = f'=SUMIF(\'{work}\'!${cfg["item_start_col"]}${cfg["stock_row"]}:${cfg["item_end_col"]}${cfg["stock_row"]},A{r},\'{work}\'!${cfg["item_start_col"]}${cfg["sqm_row"]}:${cfg["item_end_col"]}${cfg["sqm_row"]})'
-            sm.cell(r, 4).value = f'=SUMIF(\'{work}\'!${cfg["item_start_col"]}${cfg["stock_row"]}:${cfg["item_end_col"]}${cfg["stock_row"]},A{r},\'{work}\'!${cfg["item_start_col"]}${cfg["price_row"]}:${cfg["item_end_col"]}${cfg["price_row"]})'
-            sm.cell(r, 5).value = float(cfg.get("ds_loading", 20.0))
-        out = io.BytesIO()
-        wb.save(out)
-        return out.getvalue()
-    finally:
-        try:
-            wbv.close()
-            wb.close()
-        except Exception:
-            pass
+    stock_sqm_totals = {s: 0.0 for s in selected_stocks}
+    stock_price_totals = {s: 0.0 for s in selected_stocks}
+
+    for c in range(sc, ec + 1):
+        col = get_column_letter(c)
+        name_val = safe_text(ws_values.cell(name_row, c).value) or safe_text(ws.cell(name_row, c).value)
+        size_val = safe_text(ws_values.cell(size_row, c).value) or safe_text(ws.cell(size_row, c).value)
+        stock_val = safe_text(ws_values.cell(stock_row, c).value) or safe_text(ws.cell(stock_row, c).value)
+        sqm_each = parse_size_to_sqm(size_val) or 0.0
+        multiplier, status, reason = detect_multiplier(name_val)
+
+        # style from nearby row
+        for out_r in [ds_output_row, clean_qty_output_row, sqm_output_row, price_output_row]:
+            copy_cell_style(ws.cell(total_qty_row, c), ws.cell(out_r, c))
+
+        # DS/SS formula
+        ds_formula = (
+            f'=IFERROR(INDEX(\'{reference_sheet}\'!${ref_ds_col}${ref_start_row}:${ref_ds_col}${ref_end_row},'
+            f'MATCH(1,INDEX((\'{reference_sheet}\'!${ref_name_col}${ref_start_row}:${ref_name_col}${ref_end_row}={col}${name_row})*'
+            f'(\'{reference_sheet}\'!${ref_size_col}${ref_start_row}:${ref_size_col}${ref_end_row}={col}${size_row}),0),0)),"")'
+        )
+        ws.cell(ds_output_row, c).value = ds_formula
+
+        ignored_terms = []
+        for country in ignored:
+            ignored_terms.append(f'SUMIF(${country_col}${scan_start_row}:${country_col}${scan_end_row},"{country}",{col}${scan_start_row}:{col}${scan_end_row})')
+        ignored_expr = "+".join(ignored_terms) if ignored_terms else "0"
+        qty_formula = f'=({col}${total_qty_row}-({ignored_expr}))*{multiplier}'
+        ws.cell(clean_qty_output_row, c).value = qty_formula
+        ws.cell(sqm_output_row, c).value = f'={col}${clean_qty_output_row}*{sqm_each}'
+
+        rate = float(stock_rates.get(stock_val, 0) or 0)
+        ds_factor = 1 + (float(ds_loading_pct) / 100.0)
+        ws.cell(price_output_row, c).value = f'=IF(UPPER({col}${ds_output_row})="DS",{col}${sqm_output_row}*{rate}*{ds_factor},{col}${sqm_output_row}*{rate})'
+        ws.cell(price_output_row, c).number_format = '$#,##0.00'
+
+        if status == "exact":
+            for r in [name_row, clean_qty_output_row, sqm_output_row, price_output_row]:
+                ws.cell(r, c).fill = RED_FILL
+            audit_ws.append([col, name_val, multiplier, "MULTIPLIED", reason])
+        elif status == "doubt":
+            for r in [name_row, clean_qty_output_row]:
+                ws.cell(r, c).fill = ORANGE_FILL
+            audit_ws.append([col, name_val, multiplier, "CHECK - NOT MULTIPLIED", reason])
+
+        if stock_val in selected_stocks:
+            # Python-side preview totals only; formulas remain in main sheet.
+            # Use original total qty value only as approximation for summary if Excel not recalculated yet.
+            try:
+                total_qty = float(ws_values.cell(total_qty_row, c).value or 0)
+            except Exception:
+                total_qty = 0
+            approx_sqm = total_qty * multiplier * sqm_each
+            approx_price = approx_sqm * rate * (ds_factor if norm(ws_values.cell(ds_output_row, c).value) == "DS" else 1)
+            stock_sqm_totals[stock_val] += approx_sqm
+            stock_price_totals[stock_val] += approx_price
+
+    for stock in selected_stocks:
+        sum_ws.append([stock, stock_rates.get(stock, 0), stock_sqm_totals.get(stock, 0), ds_loading_pct, stock_price_totals.get(stock, 0)])
+
+    for ws2 in [sum_ws, audit_ws]:
+        for cell in ws2[1]:
+            cell.fill = GREEN_FILL
+            cell.font = Font(bold=True)
+            cell.alignment = Alignment(horizontal="center")
+        for col_cells in ws2.columns:
+            max_len = max(len(safe_text(cell.value)) for cell in col_cells)
+            ws2.column_dimensions[col_cells[0].column_letter].width = min(max_len + 2, 55)
+
+    output = io.BytesIO()
+    wb.save(output)
+    wb.close()
+    wb_values.close()
+    output.seek(0)
+    return output.getvalue()
 
 
 def main():
-    st.set_page_config(page_title="Excel Formula Fusion", layout="wide")
     st.title("Excel Formula Fusion")
-    st.caption(APP_VERSION)
-    st.warning("Stable recovery version: no workbook reading happens until you press a button.")
+    st.caption("Minimal install-safe build: Streamlit + openpyxl only")
 
-    defaults = {"uploaded_bytes": None, "uploaded_name": "", "sheets": [], "cfg": None, "rates": {}}
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
+    if "file_bytes" not in st.session_state:
+        st.session_state.file_bytes = None
+    if "sheet_names" not in st.session_state:
+        st.session_state.sheet_names = []
+    if "stock_rates" not in st.session_state:
+        st.session_state.stock_rates = {}
+    if "stock_options" not in st.session_state:
+        st.session_state.stock_options = []
 
     uploaded = st.file_uploader("Upload Excel workbook", type=["xlsx", "xlsm"])
     if uploaded is not None:
-        st.session_state.uploaded_bytes = uploaded.getvalue()
-        st.session_state.uploaded_name = uploaded.name
+        st.session_state.file_bytes = uploaded.getvalue()
         st.success(f"Uploaded: {uploaded.name}")
 
-    if not st.session_state.uploaded_bytes:
-        st.info("Upload an Excel file to start.")
+    if st.session_state.file_bytes:
+        if st.button("Read workbook / detect sheets"):
+            try:
+                st.session_state.sheet_names = get_sheet_names(st.session_state.file_bytes)
+                st.success("Workbook read successfully.")
+            except Exception as e:
+                st.error("Could not read workbook.")
+                st.code(traceback.format_exc())
+
+    if not st.session_state.sheet_names:
+        st.info("Upload a workbook, then click 'Read workbook / detect sheets'.")
         return
 
-    st.write(f"Current file: **{st.session_state.uploaded_name}**")
-    if st.button("Read workbook / detect sheets"):
-        try:
-            st.session_state.sheets = get_sheet_names_fast(st.session_state.uploaded_bytes)
-            st.success("Sheets detected: " + ", ".join(st.session_state.sheets))
-        except Exception:
-            st.error("Could not read workbook sheets")
-            st.code(traceback.format_exc())
-            return
+    sheets = st.session_state.sheet_names
+    col_a, col_b = st.columns(2)
+    with col_a:
+        working_sheet = st.selectbox("Working Sheet", sheets, index=sheets.index("DL ANZ ALLOCATION") if "DL ANZ ALLOCATION" in sheets else 0)
+    with col_b:
+        reference_sheet = st.selectbox("Reference Sheet", sheets, index=sheets.index("PRINT DB") if "PRINT DB" in sheets else 0)
 
-    sheets = st.session_state.sheets
-    if not sheets:
-        st.info("Press **Read workbook / detect sheets** before continuing.")
-        return
-
-    with st.form("mapping"):
-        st.subheader("Mapping")
-        a, b = st.columns(2)
-        with a:
-            working_sheet = st.selectbox("Working sheet", sheets, index=default_sheet(sheets, "DL ANZ ALLOCATION"))
-            name_row = int(st.number_input("Name row", min_value=1, value=4))
-            size_row = int(st.number_input("Size row", min_value=1, value=5))
-            stock_row = int(st.number_input("Stock row", min_value=1, value=6))
-            total_qty_row = int(st.number_input("Original total qty row", min_value=1, value=7))
-            country_col = safe_col(st.text_input("Country column", value="I"), "I")
-            ignored = st.text_input("Ignore countries", value="NZ")
-        with b:
-            reference_sheet = st.selectbox("Reference sheet", sheets, index=default_sheet(sheets, "PRINT DB", 1 if len(sheets) > 1 else 0))
-            ref_name_col = safe_col(st.text_input("Reference name column", value="C"), "C")
-            ref_size_col = safe_col(st.text_input("Reference size column", value="E"), "E")
-            ref_ds_col = safe_col(st.text_input("Reference DS/SS column", value="F"), "F")
-            ref_start_row = int(st.number_input("Reference start row", min_value=1, value=12))
-            ref_end_row = int(st.number_input("Reference end row", min_value=1, value=141))
+    st.subheader("Mapping")
+    with st.form("mapping_form"):
         c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            item_start_col = safe_col(st.text_input("Start column", value="AC"), "AC")
-            item_end_col = safe_col(st.text_input("End column", value="IG"), "IG")
-        with c2:
-            ds_row = int(st.number_input("DS/SS row", min_value=1, value=168))
-            clean_qty_row = int(st.number_input("Clean qty row", min_value=1, value=169))
-        with c3:
-            multiplier_row = int(st.number_input("Multiplier row", min_value=1, value=170))
-            sqm_row = int(st.number_input("SQM row", min_value=1, value=171))
-        with c4:
-            price_row = int(st.number_input("Price row", min_value=1, value=172))
-            ds_loading = float(st.number_input("DS loading %", min_value=0.0, value=20.0, step=1.0))
-        submitted = st.form_submit_button("Apply mapping / refresh stock list")
+        name_row = c1.number_input("Name row", 1, 1000, 4)
+        size_row = c2.number_input("Size row", 1, 1000, 5)
+        stock_row = c3.number_input("Stock/material row", 1, 1000, 6)
+        total_qty_row = c4.number_input("Original total qty row", 1, 1000, 7)
 
-    if submitted:
+        c5, c6, c7 = st.columns(3)
+        country_col = c5.text_input("Country column", "I")
+        start_col = c6.text_input("Start column", "AC")
+        end_col = c7.text_input("End column", "IG")
+
+        c8, c9, c10, c11 = st.columns(4)
+        ds_output_row = c8.number_input("DS/SS output row", 1, 2000, 168)
+        clean_qty_output_row = c9.number_input("Clean qty output row", 1, 2000, 169)
+        sqm_output_row = c10.number_input("SQM output row", 1, 2000, 170)
+        price_output_row = c11.number_input("Price output row", 1, 2000, 171)
+
+        ignore_text = st.text_input("Countries to ignore", "NZ")
+        applied = st.form_submit_button("Apply Mapping / Refresh Stock List")
+
+    if applied:
         try:
-            cfg = {
-                "working_sheet": working_sheet, "reference_sheet": reference_sheet,
-                "name_row": name_row, "size_row": size_row, "stock_row": stock_row, "total_qty_row": total_qty_row,
-                "country_col": country_col, "ignored_countries": [x.strip().upper() for x in ignored.split(",") if x.strip()],
-                "ref_name_col": ref_name_col, "ref_size_col": ref_size_col, "ref_ds_col": ref_ds_col,
-                "ref_start_row": ref_start_row, "ref_end_row": ref_end_row,
-                "item_start_col": item_start_col, "item_end_col": item_end_col,
-                "ds_row": ds_row, "clean_qty_row": clean_qty_row, "multiplier_row": multiplier_row, "sqm_row": sqm_row, "price_row": price_row,
-                "ds_loading": ds_loading,
-            }
-            cfg["country_scan_start"] = total_qty_row + 1
-            cfg["country_scan_end"] = detect_country_scan_end(st.session_state.uploaded_bytes, cfg)
-            cfg["stock_options"] = get_stock_options(st.session_state.uploaded_bytes, cfg)
-            cfg["selected_stocks"] = []
-            st.session_state.cfg = cfg
-            st.success(f"Mapping saved. Stock names found: {len(cfg['stock_options'])}. Country scan rows: {cfg['country_scan_start']}:{cfg['country_scan_end']}")
+            st.session_state.stock_options = get_values_for_stock_options(
+                st.session_state.file_bytes,
+                working_sheet,
+                int(stock_row),
+                parse_col(start_col, "AC"),
+                parse_col(end_col, "IG"),
+            )
+            st.success(f"Found {len(st.session_state.stock_options)} stock/material names from {parse_col(start_col,'AC')} to {parse_col(end_col,'IG')}.")
         except Exception:
-            st.error("Mapping failed")
+            st.error("Could not detect stocks/materials.")
             st.code(traceback.format_exc())
 
-    cfg = st.session_state.cfg
-    if not cfg:
-        return
+    st.subheader("Reference Sheet Mapping")
+    r1, r2, r3, r4, r5, r6 = st.columns(6)
+    ref_name_col = r1.text_input("Ref name col", "C")
+    ref_size_col = r2.text_input("Ref size col", "E")
+    ref_ds_col = r3.text_input("Ref DS/SS col", "F")
+    ref_stock_col = r4.text_input("Ref stock col", "G")
+    ref_start_row = r5.number_input("Ref start row", 1, 5000, 12)
+    ref_end_row = r6.number_input("Ref end row", 1, 5000, 141)
 
     st.subheader("Stock/material rates")
-    selected = st.multiselect("Pick stock/material to calculate SQM and rate", cfg.get("stock_options", []), default=cfg.get("selected_stocks", []))
-    cfg["selected_stocks"] = selected
-    if selected:
-        with st.form("rates"):
-            staged = {}
-            for stock in selected:
-                staged[stock] = st.number_input(f"Rate $/sqm — {stock}", min_value=0.0, value=float(st.session_state.rates.get(stock, 0.0)), step=0.1, format="%.2f")
-            if st.form_submit_button("Refresh / Update Rates"):
-                st.session_state.rates.update(staged)
-                st.success("Rates updated.")
-    st.download_button("Download stock rate memory JSON", json.dumps(st.session_state.rates, indent=2).encode("utf-8"), "stock_rate_memory.json", "application/json")
+    stock_options = st.session_state.stock_options
+    selected_stocks = st.multiselect("Pick stock/material to calculate SQM and rate", stock_options)
+
+    ds_loading_pct = st.number_input("Double-sided loading %", min_value=0.0, max_value=500.0, value=20.0, step=1.0)
+
+    with st.form("rates_form"):
+        new_rates = {}
+        if selected_stocks:
+            st.write("Enter rate per SQM for selected stock/materials:")
+            for stock in selected_stocks:
+                new_rates[stock] = st.number_input(f"Rate per SQM — {stock}", min_value=0.0, value=float(st.session_state.stock_rates.get(stock, 0.0)), step=0.10, format="%.2f")
+        else:
+            st.info("Select one or more stock/material names first.")
+        update_rates = st.form_submit_button("Refresh / Update Rates")
+
+    if update_rates:
+        st.session_state.stock_rates.update(new_rates)
+        st.success("Rates updated for this session.")
+        st.json(st.session_state.stock_rates)
+
+    st.download_button(
+        "Download stock rate memory JSON",
+        data=json.dumps(st.session_state.stock_rates, indent=2),
+        file_name="stock_rate_memory.json",
+        mime="application/json",
+    )
 
     st.subheader("Generate")
     if st.button("Generate Excel Workbook"):
         try:
             with st.spinner("Generating workbook..."):
-                output = build_workbook(st.session_state.uploaded_bytes, cfg, st.session_state.rates)
+                output_bytes = build_workbook(
+                    file_bytes=st.session_state.file_bytes,
+                    working_sheet=working_sheet,
+                    reference_sheet=reference_sheet,
+                    name_row=int(name_row),
+                    size_row=int(size_row),
+                    stock_row=int(stock_row),
+                    total_qty_row=int(total_qty_row),
+                    country_col=parse_col(country_col, "I"),
+                    start_col=parse_col(start_col, "AC"),
+                    end_col=parse_col(end_col, "IG"),
+                    ignore_countries=[x.strip() for x in ignore_text.split(",") if x.strip()],
+                    ds_output_row=int(ds_output_row),
+                    clean_qty_output_row=int(clean_qty_output_row),
+                    sqm_output_row=int(sqm_output_row),
+                    price_output_row=int(price_output_row),
+                    ref_name_col=parse_col(ref_name_col, "C"),
+                    ref_size_col=parse_col(ref_size_col, "E"),
+                    ref_ds_col=parse_col(ref_ds_col, "F"),
+                    ref_stock_col=parse_col(ref_stock_col, "G"),
+                    ref_start_row=int(ref_start_row),
+                    ref_end_row=int(ref_end_row),
+                    selected_stocks=selected_stocks,
+                    stock_rates=st.session_state.stock_rates,
+                    ds_loading_pct=float(ds_loading_pct),
+                )
             st.success("Workbook generated.")
-            st.download_button("Download Excel Workbook", output, "formula_fusion_" + st.session_state.uploaded_name, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            st.download_button(
+                "Download Excel Workbook",
+                data=output_bytes,
+                file_name="formula_fusion_output.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
         except Exception:
-            st.error("Generation failed")
+            st.error("Workbook generation failed.")
             st.code(traceback.format_exc())
 
 
 try:
     main()
 except Exception:
-    try:
-        st.error("Startup error")
-        st.code(traceback.format_exc())
-    except Exception:
-        raise
+    st.error("App startup failed.")
+    st.code(traceback.format_exc())
