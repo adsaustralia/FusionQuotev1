@@ -1,4 +1,4 @@
-# Excel Formula Fusion - Final Stock Consolidated Summary Build
+# Excel Formula Fusion - Final DS Price Only Build
 
 This build is designed for your HOKA / ASICS DBDL workbook structure.
 
@@ -13,7 +13,7 @@ This build is designed for your HOKA / ASICS DBDL workbook structure.
 - Price formulas reference a central `STOCK RATES` sheet.
 - `STOCK RATES` now includes consolidated **Total SQM** and **Total Price** per stock.
 - Change a stock rate once in `STOCK RATES` and Excel updates all linked prices and consolidated totals.
-- DS loading applies only when the DS/SS output row says `DS`.
+- DS loading applies only when the DS/SS output row says `DS`, and only in the **Price** row. The SQM row is never loaded by 1.2.
 - Confident quantity multipliers such as `set of 4` and `1 PACK = 100` are flagged red and multiplied.
 - Doubtful set/pack wording is flagged orange and not multiplied.
 - Saves backend rates to `data/stock_rates.json`.
@@ -63,6 +63,12 @@ Clean qty formula follows this structure:
 =AC$7-SUMPRODUCT((AC$8:AC$153)*(--(UPPER($I$8:$I$153)="NZ")))
 ```
 
+SQM formula follows this structure and has **no DS loading**:
+
+```excel
+=AC$169*(area from AC$5)
+```
+
 Price formula follows this structure:
 
 ```excel
@@ -90,3 +96,16 @@ app.py
 ## Warning about Streamlit Cloud storage
 
 Local JSON files can reset after redeploy or server restart. Use the app backup/download options regularly. For permanent storage, move rates to Google Sheets, a database, or PrintIQ API later.
+
+
+## DS loading rule
+
+This build enforces the rule below:
+
+```text
+Clean Qty = Row 7 total - ignored country qty
+SQM = Clean Qty × Size Area
+Price = SQM × Stock Rate × IF(DS/SS="DS", 1.2, 1)
+```
+
+DS loading is not applied to Clean Qty or SQM. It is applied only to the price formula.

@@ -11,7 +11,7 @@ import re
 import shutil
 from datetime import datetime
 
-APP_VERSION = "Final ASICS/HOKA Stable Build - Stock Consolidated Summary"
+APP_VERSION = "Final Build - DS Loading Price Only"
 DATA_DIR = "data"
 RATE_FILE = os.path.join(DATA_DIR, "stock_rates.json")
 BACKUP_DIR = os.path.join(DATA_DIR, "rate_backups")
@@ -562,12 +562,14 @@ if st.button("Generate Excel Workbook"):
                 multiplier=multiplier,
             )
 
-            # SQM = clean qty * size area
+            # SQM = clean qty * size area ONLY. Do NOT apply DS loading here.
+            # DS loading belongs only in the price formula below.
             area_formula = size_to_sqm_formula(f"{col}${m['size_row']}")
             # strip leading =
             ws.cell(row=m["output_sqm_row"], column=c).value = f"={col}${m['output_clean_qty_row']}*({area_formula[1:]})"
 
-            # Price references central STOCK RATES sheet and applies DS loading only if DS row says DS
+            # Price references central STOCK RATES sheet and applies DS loading only if DS row says DS.
+            # Pattern: SQM * Rate * IF(DS, 1.2, 1)
             ws.cell(row=m["output_price_row"], column=c).value = build_price_formula(
                 col, m["output_sqm_row"], m["output_ds_row"], m["stock_row"], m["ds_loading_pct"]
             )
