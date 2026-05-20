@@ -1,41 +1,62 @@
-# Excel Formula Fusion — Install Fix Build
+# Excel Formula Fusion — Stock Rates Build
 
-This build is intentionally minimal to fix Streamlit Cloud requirement installation errors.
+## What this build fixes
 
-## Dependencies
+This build adds a central Excel sheet called `STOCK RATES`.
 
-Only two packages are required:
+After you download the generated workbook, you can change a stock/material rate once in:
+
+`STOCK RATES` column B
+
+All price formulas in the working sheet and the `Stock SQM Summary` sheet will update automatically in Excel.
+
+## DS loading rule
+
+DS loading is not applied globally.
+
+The generated price formula checks the DS/SS output row for each item column:
+
+```excel
+=IFERROR(IF(UPPER(AR$168)="DS",AR$170*VLOOKUP(AR$6,'STOCK RATES'!$A:$B,2,FALSE)*1.2,AR$170*VLOOKUP(AR$6,'STOCK RATES'!$A:$B,2,FALSE)),0)
+```
+
+Meaning:
+
+- DS = apply loading, default 20%
+- SS = no loading
+- blank/unknown = no loading
+
+## Deployment
+
+Upload only these files to GitHub root:
+
+- `app.py`
+- `requirements.txt`
+- `README.md`
+
+Streamlit main file path:
+
+```text
+app.py
+```
+
+## Requirements
+
+Only two dependencies are used to reduce Streamlit Cloud install failures:
 
 ```txt
 streamlit>=1.31,<2
 openpyxl>=3.1.2,<4
 ```
 
-No pandas, no AgGrid, no optional UI components.
-
-## Streamlit Cloud Setup
-
-1. Upload `app.py`, `requirements.txt`, and `README.md` to the root of your GitHub repository.
-2. In Streamlit Cloud, set the main file path to:
-
-```txt
-app.py
-```
-
-3. Reboot the app from **Manage App**.
-
 ## Workflow
 
-1. Upload Excel workbook.
+1. Upload workbook.
 2. Click **Read workbook / detect sheets**.
-3. Select working and reference sheets.
-4. Confirm mapping values.
-5. Select stocks/materials.
-6. Enter stock rates.
+3. Confirm working and reference sheets.
+4. Apply mapping / refresh stock list.
+5. Pick stock/materials.
+6. Enter rates.
 7. Click **Refresh / Update Rates**.
-8. Click **Generate Excel Workbook**.
-9. Download output workbook.
-
-## Notes
-
-This version avoids heavy processing on upload. Workbook processing only happens after button clicks.
+8. Generate workbook.
+9. In Excel, edit rates in `STOCK RATES` if needed.

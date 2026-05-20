@@ -140,74 +140,91 @@ def build_workbook(
     stock_rates: Dict[str, float],
     ds_loading_pct: float,
 ) -> bytes:
-    # formula preserving workbook
+    """Generate workbook with central stock-rate sheet.
+
+    Important design rule:
+    - Streamlit writes formulas and a STOCK RATES sheet.
+    - Excel remains the calculation engine.
+    - If the user changes one stock rate in STOCK RATES, all formulas update automatically.
+    - DS loading is applied only when the DS/SS output row for that item equals DS.
+    """
     wb = load_workbook(io.BytesIO(file_bytes), data_only=False)
-    # value-only workbook for stock/material values
     wb_values = load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=True)
     ws = wb[working_sheet]
     ws_values = wb_values[working_sheet]
 
     sc = column_index_from_string(start_col)
     ec = column_index_from_string(end_col)
+    first_col = get_column_letter(sc)
+    last_col = get_column_letter(ec)
     country_col = parse_col(country_col, "I")
     ignored = [c.strip().upper() for c in ignore_countries if c.strip()]
+    ds_factor = 1 + (float(ds_loading_pct) / 100.0)
 
-    # Output row labels
-    ws.cell(ds_output_row, max(1, sc - 1)).value = "DS/SS Lookup"
-    ws.cell(clean_qty_output_row, max(1, sc - 1)).value = "Clean Qty"
-    ws.cell(sqm_output_row, max(1, sc - 1)).value = "SQM"
-    ws.cell(price_output_row, max(1, sc - 1)).value = "Price"
+    # Replace generated sheets to avoid stale formulas.
+    generated_sheets = ["STOCK RATES", "Stock SQM Summary", "Qty Multiplier Audit"]
+    for sname in generated_sheets:
+        if sname in wb.sheetnames:
+            del wb[sname]
 
-    # crude but safe ignored qty formula: total row minus sum of ignored country rows.
-    # Since workbook row layout varies, we look from row 8 to one row above total output labels by default.
-    # Blank country rows are excluded because only matched ignored countries are summed.
-    scan_start_row = total_qty_row + 1
-    scan_end_row = min(ws.max_row, ds_output_row - 1) if ds_output_row > scan_start_row else ws.max_row
-
-    # Add / replace audit sheets
-    for s in ["Stock SQM Summary", "Qty Multiplier Audit"]:
-        if s in wb.sheetnames:
-            del wb[s]
+    rate_ws = wb.create_sheet("STOCK RATES")
     sum_ws = wb.create_sheet("Stock SQM Summary")
     audit_ws = wb.create_sheet("Qty Multiplier Audit")
 
-    sum_ws.append(["Stock/Material", "Rate", "Total SQM", "DS Loading %", "Estimated Value"])
-    audit_ws.append(["Column", "Name", "Detected Multiplier", "Status", "Reason"])
+    # Central rate table. This is the key feature.
+    rate_ws.append(["Stock/Material", "Rate per SQM"])
+    rate_stocks = list(dict.fromkeys(list(selected_stocks) + list(stock_rates.keys())))
+    for stock in rate_stocks:
+        rate_ws.append([stock, float(stock_rates.get(stock, 0) or 0)])
+        rate_ws.cell(rate_ws.max_row, 2).number_format = '$#,##0.00'
 
-    stock_sqm_totals = {s: 0.0 for s in selected_stocks}
-    stock_price_totals = {s: 0.0 for s in selected_stocks}
+    # Output labels
+    label_col = max(1, sc - 1)
+    ws.cell(ds_output_row, label_col).value = "DS/SS Lookup"
+    ws.cell(clean_qty_output_row, label_col).value = "Clean Qty"
+    ws.cell(sqm_output_row, label_col).value = "SQM"
+    ws.cell(price_output_row, label_col).value = "Price"
 
+    # We subtract ignored-country quantities from total row.
+    # Start from row below total qty and stop before generated output rows.
+    scan_start_row = total_qty_row + 1
+    scan_end_row = min(ws.max_row, min(ds_output_row, clean_qty_output_row, sqm_output_row, price_output_row) - 1)
+    if scan_end_row < scan_start_row:
+        scan_end_row = ws.max_row
+
+    # Main generated formulas
     for c in range(sc, ec + 1):
         col = get_column_letter(c)
         name_val = safe_text(ws_values.cell(name_row, c).value) or safe_text(ws.cell(name_row, c).value)
         size_val = safe_text(ws_values.cell(size_row, c).value) or safe_text(ws.cell(size_row, c).value)
-        stock_val = safe_text(ws_values.cell(stock_row, c).value) or safe_text(ws.cell(stock_row, c).value)
         sqm_each = parse_size_to_sqm(size_val) or 0.0
         multiplier, status, reason = detect_multiplier(name_val)
 
-        # style from nearby row
         for out_r in [ds_output_row, clean_qty_output_row, sqm_output_row, price_output_row]:
             copy_cell_style(ws.cell(total_qty_row, c), ws.cell(out_r, c))
 
-        # DS/SS formula
-        ds_formula = (
+        ws.cell(ds_output_row, c).value = (
             f'=IFERROR(INDEX(\'{reference_sheet}\'!${ref_ds_col}${ref_start_row}:${ref_ds_col}${ref_end_row},'
             f'MATCH(1,INDEX((\'{reference_sheet}\'!${ref_name_col}${ref_start_row}:${ref_name_col}${ref_end_row}={col}${name_row})*'
             f'(\'{reference_sheet}\'!${ref_size_col}${ref_start_row}:${ref_size_col}${ref_end_row}={col}${size_row}),0),0)),"")'
         )
-        ws.cell(ds_output_row, c).value = ds_formula
 
         ignored_terms = []
         for country in ignored:
-            ignored_terms.append(f'SUMIF(${country_col}${scan_start_row}:${country_col}${scan_end_row},"{country}",{col}${scan_start_row}:{col}${scan_end_row})')
+            ignored_terms.append(
+                f'SUMIF(${country_col}${scan_start_row}:${country_col}${scan_end_row},"{country}",{col}${scan_start_row}:{col}${scan_end_row})'
+            )
         ignored_expr = "+".join(ignored_terms) if ignored_terms else "0"
-        qty_formula = f'=({col}${total_qty_row}-({ignored_expr}))*{multiplier}'
-        ws.cell(clean_qty_output_row, c).value = qty_formula
+        ws.cell(clean_qty_output_row, c).value = f'=({col}${total_qty_row}-({ignored_expr}))*{multiplier}'
         ws.cell(sqm_output_row, c).value = f'={col}${clean_qty_output_row}*{sqm_each}'
 
-        rate = float(stock_rates.get(stock_val, 0) or 0)
-        ds_factor = 1 + (float(ds_loading_pct) / 100.0)
-        ws.cell(price_output_row, c).value = f'=IF(UPPER({col}${ds_output_row})="DS",{col}${sqm_output_row}*{rate}*{ds_factor},{col}${sqm_output_row}*{rate})'
+        # Centralised stock rate lookup. Change a rate in STOCK RATES and all prices update.
+        rate_lookup = f"VLOOKUP({col}${stock_row},'STOCK RATES'!$A:$B,2,FALSE)"
+        ws.cell(price_output_row, c).value = (
+            f'=IFERROR(IF(UPPER({col}${ds_output_row})="DS",'
+            f'{col}${sqm_output_row}*{rate_lookup}*{ds_factor},'
+            f'{col}${sqm_output_row}*{rate_lookup}),0)'
+        )
         ws.cell(price_output_row, c).number_format = '$#,##0.00'
 
         if status == "exact":
@@ -219,29 +236,36 @@ def build_workbook(
                 ws.cell(r, c).fill = ORANGE_FILL
             audit_ws.append([col, name_val, multiplier, "CHECK - NOT MULTIPLIED", reason])
 
-        if stock_val in selected_stocks:
-            # Python-side preview totals only; formulas remain in main sheet.
-            # Use original total qty value only as approximation for summary if Excel not recalculated yet.
-            try:
-                total_qty = float(ws_values.cell(total_qty_row, c).value or 0)
-            except Exception:
-                total_qty = 0
-            approx_sqm = total_qty * multiplier * sqm_each
-            approx_price = approx_sqm * rate * (ds_factor if norm(ws_values.cell(ds_output_row, c).value) == "DS" else 1)
-            stock_sqm_totals[stock_val] += approx_sqm
-            stock_price_totals[stock_val] += approx_price
+    # Summary sheet is formula-driven and references the same STOCK RATES table.
+    sum_ws.append(["Stock/Material", "Rate", "Total SQM", "SS/Other SQM", "DS SQM", "DS Loading %", "Estimated Value"])
+    sum_ws.append(["NOTE", "", "", "", "", "", "Change rates in STOCK RATES column B; all formulas update automatically in Excel."])
 
     for stock in selected_stocks:
-        sum_ws.append([stock, stock_rates.get(stock, 0), stock_sqm_totals.get(stock, 0), ds_loading_pct, stock_price_totals.get(stock, 0)])
+        next_row = sum_ws.max_row + 1
+        total_sqm_formula = (
+            f"=SUMIF('{working_sheet}'!${first_col}${stock_row}:${last_col}${stock_row},"
+            f"A{next_row},'{working_sheet}'!${first_col}${sqm_output_row}:${last_col}${sqm_output_row})"
+        )
+        ds_sqm_formula = (
+            f'=SUMPRODUCT((\'{working_sheet}\'!${first_col}${stock_row}:${last_col}${stock_row}=A{next_row})*'
+            f'(UPPER(\'{working_sheet}\'!${first_col}${ds_output_row}:${last_col}${ds_output_row})="DS")*'
+            f'(\'{working_sheet}\'!${first_col}${sqm_output_row}:${last_col}${sqm_output_row}))'
+        )
+        ss_sqm_formula = f"=C{next_row}-E{next_row}"
+        rate_formula = f"=IFERROR(VLOOKUP(A{next_row},'STOCK RATES'!$A:$B,2,FALSE),0)"
+        estimated_value_formula = f"=D{next_row}*B{next_row}+E{next_row}*B{next_row}*(1+F{next_row}/100)"
+        sum_ws.append([stock, rate_formula, total_sqm_formula, ss_sqm_formula, ds_sqm_formula, ds_loading_pct, estimated_value_formula])
+        sum_ws.cell(next_row, 2).number_format = '$#,##0.00'
+        sum_ws.cell(next_row, 7).number_format = '$#,##0.00'
 
-    for ws2 in [sum_ws, audit_ws]:
+    for ws2 in [rate_ws, sum_ws, audit_ws]:
         for cell in ws2[1]:
             cell.fill = GREEN_FILL
             cell.font = Font(bold=True)
             cell.alignment = Alignment(horizontal="center")
         for col_cells in ws2.columns:
             max_len = max(len(safe_text(cell.value)) for cell in col_cells)
-            ws2.column_dimensions[col_cells[0].column_letter].width = min(max_len + 2, 55)
+            ws2.column_dimensions[col_cells[0].column_letter].width = min(max_len + 2, 70)
 
     output = io.BytesIO()
     wb.save(output)
@@ -250,10 +274,9 @@ def build_workbook(
     output.seek(0)
     return output.getvalue()
 
-
 def main():
     st.title("Excel Formula Fusion")
-    st.caption("Minimal install-safe build: Streamlit + openpyxl only")
+    st.caption("Install-safe build: DS loading applies only when DS/SS row = DS")
 
     if "file_bytes" not in st.session_state:
         st.session_state.file_bytes = None
