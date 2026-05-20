@@ -1,40 +1,50 @@
-# Excel Formula Fusion — Stock Rates Build
+# Excel Formula Fusion - Final JSON Backup Build
 
-## What this build fixes
+## What this build does
 
-This build adds a central Excel sheet called `STOCK RATES`.
+- Upload Excel workbook
+- Select working/reference sheets
+- Generate Excel formulas
+- Clean qty = original total qty minus ignored country qty
+- DS/SS lookup from reference sheet
+- Stock/material lookup from reference sheet
+- Central `STOCK RATES` sheet in exported Excel
+- Price formulas reference `STOCK RATES`, so changing one rate updates all linked formulas in Excel
+- DS loading applies only when DS/SS row equals `DS`
+- Detects quantity multipliers:
+  - `set of 4` multiplies by 4 and highlights red
+  - `1 PACK = 100` multiplies by 100 and highlights red
+  - uncertain set/pack wording highlights orange and does not multiply
+- Saves stock rates to backend JSON:
+  - `data/stock_rates.json`
+- Every save creates dated backups:
+  - `data/rate_backups/stock_rates_YYYYMMDD_HHMMSS.json`
+  - `data/rate_backups/stock_rates_saved_YYYYMMDD_HHMMSS.json`
 
-After you download the generated workbook, you can change a stock/material rate once in:
+## Important Streamlit Cloud warning
 
-`STOCK RATES` column B
+Streamlit Cloud local files may reset after reboot or redeploy.  
+The backend JSON works during normal server use, but it is not as reliable as a database.
 
-All price formulas in the working sheet and the `Stock SQM Summary` sheet will update automatically in Excel.
+Use the app's **Download current stock_rates.json** and backup download regularly.
 
-## DS loading rule
+Long-term best options:
+1. Google Sheet rate database
+2. SQLite/Postgres database
+3. PrintIQ API stock price source
 
-DS loading is not applied globally.
+## Deploy
 
-The generated price formula checks the DS/SS output row for each item column:
+Upload only these files/folders to GitHub:
 
-```excel
-=IFERROR(IF(UPPER(AR$168)="DS",AR$170*VLOOKUP(AR$6,'STOCK RATES'!$A:$B,2,FALSE)*1.2,AR$170*VLOOKUP(AR$6,'STOCK RATES'!$A:$B,2,FALSE)),0)
+```text
+app.py
+requirements.txt
+README.md
+data/
 ```
 
-Meaning:
-
-- DS = apply loading, default 20%
-- SS = no loading
-- blank/unknown = no loading
-
-## Deployment
-
-Upload only these files to GitHub root:
-
-- `app.py`
-- `requirements.txt`
-- `README.md`
-
-Streamlit main file path:
+Streamlit main file:
 
 ```text
 app.py
@@ -42,21 +52,7 @@ app.py
 
 ## Requirements
 
-Only two dependencies are used to reduce Streamlit Cloud install failures:
-
 ```txt
 streamlit>=1.31,<2
 openpyxl>=3.1.2,<4
 ```
-
-## Workflow
-
-1. Upload workbook.
-2. Click **Read workbook / detect sheets**.
-3. Confirm working and reference sheets.
-4. Apply mapping / refresh stock list.
-5. Pick stock/materials.
-6. Enter rates.
-7. Click **Refresh / Update Rates**.
-8. Generate workbook.
-9. In Excel, edit rates in `STOCK RATES` if needed.
