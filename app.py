@@ -11,7 +11,7 @@ import re
 import shutil
 from datetime import datetime
 
-APP_VERSION = "Final JSON Backup Build"
+APP_VERSION = "Final Build - Circular Reference + Speed Fix"
 DATA_DIR = "data"
 RATE_FILE = os.path.join(DATA_DIR, "stock_rates.json")
 BACKUP_DIR = os.path.join(DATA_DIR, "rate_backups")
@@ -150,13 +150,35 @@ def detect_multiplier(text):
 def workbook_sheet_names(uploaded_file):
     data = uploaded_file.getvalue()
     wb = load_workbook(BytesIO(data), read_only=True, data_only=False)
-    return wb.sheetnames
+    names = wb.sheetnames
+    wb.close()
+    return names
 
-def load_workbooks(uploaded_file):
+def load_value_workbook(uploaded_file):
+    # read_only + data_only keeps stock/name detection light and avoids holding styles twice
     data = uploaded_file.getvalue()
-    wb_formula = load_workbook(BytesIO(data), data_only=False)
-    wb_values = load_workbook(BytesIO(data), data_only=True)
-    return wb_formula, wb_values
+    return load_workbook(BytesIO(data), read_only=True, data_only=True)
+
+def load_formula_workbook(uploaded_file):
+    # only used when generating the downloadable workbook
+    data = uploaded_file.getvalue()
+    return load_workbook(BytesIO(data), data_only=False)
+
+def output_rows_are_safe(m):
+    rows = {
+        "DS/SS output row": m["output_ds_row"],
+        "Clean qty output row": m["output_clean_qty_row"],
+        "SQM output row": m["output_sqm_row"],
+        "Price output row": m["output_price_row"],
+    }
+    seen = {}
+    duplicates = []
+    for label, row in rows.items():
+        if row in seen:
+            duplicates.append(f"{label} is the same as {seen[row]} (row {row})")
+        else:
+            seen[row] = label
+    return duplicates
 
 def make_stock_rates_sheet(wb, rates):
     name = "STOCK RATES"
@@ -370,7 +392,7 @@ m = st.session_state.mapping
 
 # Load value workbook only when needed to find stock names
 try:
-    wb_formula_tmp, wb_values_tmp = load_workbooks(uploaded)
+    wb_values_tmp = load_value_workbook(uploaded)
     ws_values = wb_values_tmp[m["working_sheet"]]
     start_idx = column_index_from_string(m["start_col_letter"])
     end_idx = column_index_from_string(m["end_col_letter"])
@@ -382,7 +404,7 @@ try:
         if v:
             stock_values.append(v)
     unique_stocks = sorted(set(stock_values))
-    del wb_formula_tmp, wb_values_tmp
+    wb_values_tmp.close()
 except Exception as e:
     st.error("Could not load stock list from selected mapping.")
     st.exception(e)
@@ -439,9 +461,17 @@ st.header("4. Generate workbook")
 st.write("Current mapping:")
 st.json(m)
 
+row_conflicts = output_rows_are_safe(m)
+if row_conflicts:
+    st.error("Output row conflict detected. This would create circular Excel formulas.")
+    for conflict in row_conflicts:
+        st.write(f"- {conflict}")
+    st.stop()
+
 if st.button("Generate Excel Workbook"):
     try:
-        wb, wb_values = load_workbooks(uploaded)
+        wb = load_formula_workbook(uploaded)
+        wb_values = load_value_workbook(uploaded)
         ws = wb[m["working_sheet"]]
         ws_values = wb_values[m["working_sheet"]]
 
@@ -528,6 +558,7 @@ if st.button("Generate Excel Workbook"):
         output = BytesIO()
         wb.save(output)
         output.seek(0)
+        wb_values.close()
 
         st.success("Workbook generated.")
         st.download_button(
