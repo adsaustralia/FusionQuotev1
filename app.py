@@ -11,7 +11,7 @@ import re
 import shutil
 from datetime import datetime
 
-APP_VERSION = "Final ASICS/HOKA Stable Build - No Circular References"
+APP_VERSION = "Final ASICS/HOKA Stable Build - Stock Consolidated Summary"
 DATA_DIR = "data"
 RATE_FILE = os.path.join(DATA_DIR, "stock_rates.json")
 BACKUP_DIR = os.path.join(DATA_DIR, "rate_backups")
@@ -158,36 +158,58 @@ def load_workbooks(uploaded_file):
     wb_values = load_workbook(BytesIO(data), data_only=True)
     return wb_formula, wb_values
 
-def make_stock_rates_sheet(wb, rates):
+def make_stock_rates_sheet(wb, rates, mapping=None):
     name = "STOCK RATES"
     if name in wb.sheetnames:
         del wb[name]
     ws = wb.create_sheet(name)
-    ws["A1"] = "Stock"
-    ws["B1"] = "Rate"
-    ws["C1"] = "Last Generated"
+    headers = ["Stock", "Rate", "Total SQM", "Total Price", "Last Generated"]
+    for idx, header in enumerate(headers, start=1):
+        ws.cell(row=1, column=idx, value=header)
     for cell in ws[1]:
         cell.font = Font(bold=True)
         cell.fill = PatternFill("solid", fgColor="FFD966")
         cell.alignment = Alignment(horizontal="center")
 
     row = 2
+    working_sheet_formula_name = None
+    if mapping:
+        working_sheet_formula_name = excel_quote_sheet(mapping["working_sheet"])
+        start_col = mapping["start_col_letter"]
+        end_col = mapping["end_col_letter"]
+        stock_row = mapping["stock_row"]
+        sqm_row = mapping["output_sqm_row"]
+        price_row = mapping["output_price_row"]
+
     for stock, rate in sorted(rates.items()):
         ws.cell(row=row, column=1, value=stock)
         ws.cell(row=row, column=2, value=float(rate or 0))
-        ws.cell(row=row, column=3, value=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        if mapping and working_sheet_formula_name:
+            # Consolidated totals per stock.
+            # These formulas update automatically if the stock rate changes in column B
+            # or if any generated worksheet formula changes.
+            ws.cell(row=row, column=3, value=f'=SUMIF({working_sheet_formula_name}!${start_col}${stock_row}:${end_col}${stock_row},A{row},{working_sheet_formula_name}!${start_col}${sqm_row}:${end_col}${sqm_row})')
+            ws.cell(row=row, column=4, value=f'=SUMIF({working_sheet_formula_name}!${start_col}${stock_row}:${end_col}${stock_row},A{row},{working_sheet_formula_name}!${start_col}${price_row}:${end_col}${price_row})')
+        else:
+            ws.cell(row=row, column=3, value="")
+            ws.cell(row=row, column=4, value="")
+        ws.cell(row=row, column=5, value=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         row += 1
 
     if row > 2:
-        ref = f"A1:C{row-1}"
+        ref = f"A1:E{row-1}"
         tab = Table(displayName="StockRates", ref=ref)
         style = TableStyleInfo(name="TableStyleMedium9", showRowStripes=True, showColumnStripes=False)
         tab.tableStyleInfo = style
         ws.add_table(tab)
 
-    ws.column_dimensions["A"].width = 45
-    ws.column_dimensions["B"].width = 15
-    ws.column_dimensions["C"].width = 24
+    widths = {"A": 45, "B": 15, "C": 18, "D": 18, "E": 24}
+    for col, width in widths.items():
+        ws.column_dimensions[col].width = width
+    for r in range(2, row):
+        ws.cell(row=r, column=2).number_format = '$#,##0.00'
+        ws.cell(row=r, column=3).number_format = '0.00'
+        ws.cell(row=r, column=4).number_format = '$#,##0.00'
     return ws
 
 def build_clean_qty_formula(col, qty_total_row, country_col, first_store_row, last_store_row, ignore_countries, multiplier=1):
@@ -491,7 +513,7 @@ if st.button("Generate Excel Workbook"):
         ws = wb[m["working_sheet"]]
         ws_values = wb_values[m["working_sheet"]]
 
-        make_stock_rates_sheet(wb, load_rates())
+        make_stock_rates_sheet(wb, load_rates(), m)
 
         start_idx = column_index_from_string(m["start_col_letter"])
         end_idx = column_index_from_string(m["end_col_letter"])
