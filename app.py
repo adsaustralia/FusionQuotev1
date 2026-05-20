@@ -11,7 +11,7 @@ import re
 import shutil
 from datetime import datetime
 
-APP_VERSION = "Final Build - Circular Reference + Speed Fix"
+APP_VERSION = "Final ASICS/HOKA Stable Build - No Circular References"
 DATA_DIR = "data"
 RATE_FILE = os.path.join(DATA_DIR, "stock_rates.json")
 BACKUP_DIR = os.path.join(DATA_DIR, "rate_backups")
@@ -150,35 +150,13 @@ def detect_multiplier(text):
 def workbook_sheet_names(uploaded_file):
     data = uploaded_file.getvalue()
     wb = load_workbook(BytesIO(data), read_only=True, data_only=False)
-    names = wb.sheetnames
-    wb.close()
-    return names
+    return wb.sheetnames
 
-def load_value_workbook(uploaded_file):
-    # read_only + data_only keeps stock/name detection light and avoids holding styles twice
+def load_workbooks(uploaded_file):
     data = uploaded_file.getvalue()
-    return load_workbook(BytesIO(data), read_only=True, data_only=True)
-
-def load_formula_workbook(uploaded_file):
-    # only used when generating the downloadable workbook
-    data = uploaded_file.getvalue()
-    return load_workbook(BytesIO(data), data_only=False)
-
-def output_rows_are_safe(m):
-    rows = {
-        "DS/SS output row": m["output_ds_row"],
-        "Clean qty output row": m["output_clean_qty_row"],
-        "SQM output row": m["output_sqm_row"],
-        "Price output row": m["output_price_row"],
-    }
-    seen = {}
-    duplicates = []
-    for label, row in rows.items():
-        if row in seen:
-            duplicates.append(f"{label} is the same as {seen[row]} (row {row})")
-        else:
-            seen[row] = label
-    return duplicates
+    wb_formula = load_workbook(BytesIO(data), data_only=False)
+    wb_values = load_workbook(BytesIO(data), data_only=True)
+    return wb_formula, wb_values
 
 def make_stock_rates_sheet(wb, rates):
     name = "STOCK RATES"
@@ -264,6 +242,48 @@ def find_nonempty_cols(ws_values, row, start_col, end_col):
             cols.append(c)
     return cols
 
+
+def parse_sum_range_from_total_formula(formula):
+    """Return (start_row, end_row) from formulas like =SUM(AC8:AC153)."""
+    if not formula or not isinstance(formula, str):
+        return None
+    m = re.search(r"SUM\(\$?[A-Z]+\$?(\d+)\s*:\s*\$?[A-Z]+\$?(\d+)\)", formula.upper())
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2))
+
+def auto_detect_store_range(ws_formula, qty_total_row, start_col_idx, end_col_idx):
+    """Detect store qty rows from the first total-row SUM formula in the item columns."""
+    for c in range(start_col_idx, end_col_idx + 1):
+        rng = parse_sum_range_from_total_formula(ws_formula.cell(row=qty_total_row, column=c).value)
+        if rng:
+            return rng
+    return 8, max(8, qty_total_row + 146)
+
+def validate_output_rows(mapping):
+    rows = {
+        "DS/SS output row": mapping["output_ds_row"],
+        "Clean qty output row": mapping["output_clean_qty_row"],
+        "SQM output row": mapping["output_sqm_row"],
+        "Price output row": mapping["output_price_row"],
+    }
+    seen = {}
+    for label, row in rows.items():
+        if row in seen:
+            raise ValueError(f"Output row conflict: {label} and {seen[row]} are both row {row}.")
+        seen[row] = label
+    protected = {
+        mapping["name_row"]: "Name row",
+        mapping["size_row"]: "Size row",
+        mapping["stock_row"]: "Stock/material row",
+        mapping["qty_total_row"]: "Original total qty row",
+    }
+    for label, row in rows.items():
+        if row in protected:
+            raise ValueError(f"Circular risk: {label} cannot overwrite {protected[row]} ({row}).")
+        if mapping["first_store_row"] <= row <= mapping["last_store_row"]:
+            raise ValueError(f"Circular risk: {label} row {row} is inside store qty rows {mapping['first_store_row']}:{mapping['last_store_row']}.")
+
 # -----------------------------
 # UI
 # -----------------------------
@@ -335,7 +355,8 @@ with st.form("mapping_form"):
         qty_total_row = st.number_input("Original total qty row", min_value=1, value=7, step=1)
         country_col = st.text_input("Country column", value="I")
         first_store_row = st.number_input("First store row for ignored-country subtraction", min_value=1, value=8, step=1)
-        last_store_row = st.number_input("Last store row for ignored-country subtraction", min_value=1, value=166, step=1)
+        last_store_row = st.number_input("Last store row for ignored-country subtraction", min_value=1, value=153, step=1)
+        st.caption("Tip: for ASICS row 7 totals usually use SUM(row 8:153). Keep output rows outside this range.")
 
     with c2:
         ref_sheet = st.selectbox("Reference sheet", sheet_names, index=default_ref)
@@ -392,11 +413,12 @@ m = st.session_state.mapping
 
 # Load value workbook only when needed to find stock names
 try:
-    wb_values_tmp = load_value_workbook(uploaded)
+    wb_formula_tmp, wb_values_tmp = load_workbooks(uploaded)
     ws_values = wb_values_tmp[m["working_sheet"]]
     start_idx = column_index_from_string(m["start_col_letter"])
     end_idx = column_index_from_string(m["end_col_letter"])
     item_cols = find_nonempty_cols(ws_values, m["name_row"], start_idx, end_idx)
+    detected_range = auto_detect_store_range(wb_formula_tmp[m["working_sheet"]], m["qty_total_row"], start_idx, end_idx)
 
     stock_values = []
     for c in item_cols:
@@ -404,7 +426,8 @@ try:
         if v:
             stock_values.append(v)
     unique_stocks = sorted(set(stock_values))
-    wb_values_tmp.close()
+    st.info(f"Detected store qty range from total row formula: rows {detected_range[0]}:{detected_range[1]}. If your mapping shows a different range, update it before export.")
+    del wb_formula_tmp, wb_values_tmp
 except Exception as e:
     st.error("Could not load stock list from selected mapping.")
     st.exception(e)
@@ -461,17 +484,10 @@ st.header("4. Generate workbook")
 st.write("Current mapping:")
 st.json(m)
 
-row_conflicts = output_rows_are_safe(m)
-if row_conflicts:
-    st.error("Output row conflict detected. This would create circular Excel formulas.")
-    for conflict in row_conflicts:
-        st.write(f"- {conflict}")
-    st.stop()
-
 if st.button("Generate Excel Workbook"):
     try:
-        wb = load_formula_workbook(uploaded)
-        wb_values = load_value_workbook(uploaded)
+        validate_output_rows(m)
+        wb, wb_values = load_workbooks(uploaded)
         ws = wb[m["working_sheet"]]
         ws_values = wb_values[m["working_sheet"]]
 
@@ -509,12 +525,9 @@ if st.button("Generate Excel Workbook"):
                 m["ref_name_col"], m["ref_size_col"], m["ref_ds_col"]
             )
 
-            # Stock/material formula
-            ws.cell(row=m["stock_row"], column=c).value = build_stock_formula(
-                col, m["name_row"], m["size_row"],
-                m["ref_sheet"], m["ref_start_row"], m["ref_end_row"],
-                m["ref_name_col"], m["ref_size_col"], m["ref_stock_col"]
-            )
+            # Keep original stock/material row untouched.
+            # The working sheet already links row 6 to PRINT DB in current workbooks.
+            # Price formulas reference this row, so changing STOCK RATES updates prices without rebuilding.
 
             # Clean qty
             ws.cell(row=m["output_clean_qty_row"], column=c).value = build_clean_qty_formula(
@@ -558,7 +571,6 @@ if st.button("Generate Excel Workbook"):
         output = BytesIO()
         wb.save(output)
         output.seek(0)
-        wb_values.close()
 
         st.success("Workbook generated.")
         st.download_button(
